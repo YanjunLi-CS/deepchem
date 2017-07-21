@@ -5,7 +5,7 @@ from collections import Sequence
 import tensorflow as tf
 import numpy as np
 
-from deepchem.nn import model_ops, initializations
+from deepchem.nn import model_ops, initializations, regularizers, activations
 
 
 class Layer(object):
@@ -27,6 +27,9 @@ class Layer(object):
     self.in_layers = in_layers
     self.op_type = "gpu"
     self.variable_scope = ''
+    self.rnn_initial_states = []
+    self.rnn_final_states = []
+    self.rnn_zero_states = []
 
   def _get_layer_number(self):
     class_name = self.__class__.__name__
@@ -138,17 +141,45 @@ def convert_to_layers(in_layers):
 
 
 class Conv1D(Layer):
+  """A 1D convolution on the input.
 
-  def __init__(self, width, out_channels, **kwargs):
+  This layer expects its input to be a three dimensional tensor of shape (batch size, width, # channels).
+  """
+
+  def __init__(self,
+               width,
+               out_channels,
+               stride=1,
+               padding='SAME',
+               activation_fn=tf.nn.relu,
+               **kwargs):
+    """Create a Conv1D layer.
+
+    Parameters
+    ----------
+    width: int
+      the width of the convolutional kernel
+    out_channels: int
+      the number of outputs produced by the convolutional kernel
+    stride: int
+      the stride between applications of the convolutional kernel
+    padding: str
+      the padding method to use, either 'SAME' or 'VALID'
+    activation_fn: object
+      the Tensorflow activation function to apply to the output
+    """
     self.width = width
     self.out_channels = out_channels
+    self.stride = stride
+    self.padding = padding
+    self.activation_fn = activation_fn
     self.out_tensor = None
     super(Conv1D, self).__init__(**kwargs)
 
   def create_tensor(self, in_layers=None, set_tensors=True, **kwargs):
     inputs = self._get_input_tensors(in_layers)
     if len(inputs) != 1:
-      raise ValueError("Only One Parent to conv1D over")
+      raise ValueError("Conv1D layer must have exactly one parent")
     parent = inputs[0]
     if len(parent.get_shape()) != 3:
       raise ValueError("Parent tensor must be (batch, width, channel)")
@@ -157,9 +188,9 @@ class Conv1D(Layer):
     f = tf.Variable(
         tf.random_normal([self.width, parent_channel_size, self.out_channels]))
     b = tf.Variable(tf.random_normal([self.out_channels]))
-    t = tf.nn.conv1d(parent, f, stride=1, padding="SAME")
+    t = tf.nn.conv1d(parent, f, stride=self.stride, padding=self.padding)
     t = tf.nn.bias_add(t, b)
-    out_tensor = tf.nn.relu(t)
+    out_tensor = self.activation_fn(t)
     if set_tensors:
       self._record_variable_scope(self.name)
       self.out_tensor = out_tensor
@@ -395,15 +426,34 @@ class GRU(Layer):
       raise ValueError("Must have one parent")
     parent_tensor = inputs[0]
     gru_cell = tf.contrib.rnn.GRUCell(self.n_hidden)
-    initial_gru_state = gru_cell.zero_state(self.batch_size, tf.float32)
-    out_tensor, rnn_states = tf.nn.dynamic_rnn(
-        gru_cell,
-        parent_tensor,
-        initial_state=initial_gru_state,
-        scope=self.name)
+    zero_state = gru_cell.zero_state(self.batch_size, tf.float32)
     if set_tensors:
+      initial_state = tf.placeholder(tf.float32, zero_state.get_shape())
+    else:
+      initial_state = zero_state
+    out_tensor, final_state = tf.nn.dynamic_rnn(
+        gru_cell, parent_tensor, initial_state=initial_state, scope=self.name)
+    if set_tensors:
+      self._record_variable_scope(self.name)
       self.out_tensor = out_tensor
+      self.rnn_initial_states.append(initial_state)
+      self.rnn_final_states.append(final_state)
+      self.rnn_zero_states.append(np.zeros(zero_state.get_shape(), np.float32))
     return out_tensor
+
+  def none_tensors(self):
+    saved_tensors = [
+        self.out_tensor, self.rnn_initial_states, self.rnn_final_states,
+        self.rnn_zero_states
+    ]
+    self.out_tensor = None
+    self.rnn_initial_states = []
+    self.rnn_final_states = []
+    self.rnn_zero_states = []
+    return saved_tensors
+
+  def set_tensors(self, tensor):
+    self.out_tensor, self.rnn_initial_states, self.rnn_final_states, self.rnn_zero_states = tensor
 
 
 class TimeSeriesDense(Layer):
@@ -745,6 +795,7 @@ class Conv2D(Layer):
                stride=1,
                padding='SAME',
                activation_fn=tf.nn.relu,
+               normalizer_fn=None,
                scope_name=None,
                **kwargs):
     """Create a Conv2D layer.
@@ -765,12 +816,15 @@ class Conv2D(Layer):
       the padding method to use, either 'SAME' or 'VALID'
     activation_fn: object
       the Tensorflow activation function to apply to the output
+    normalizer_fn: object
+      the Tensorflow normalizer function to apply to the output
     """
     self.num_outputs = num_outputs
     self.kernel_size = kernel_size
     self.stride = stride
     self.padding = padding
     self.activation_fn = activation_fn
+    self.normalizer_fn = normalizer_fn
     super(Conv2D, self).__init__(**kwargs)
     if scope_name is None:
       scope_name = self.name
@@ -786,7 +840,7 @@ class Conv2D(Layer):
         stride=self.stride,
         padding=self.padding,
         activation_fn=self.activation_fn,
-        normalizer_fn=tf.contrib.layers.batch_norm,
+        normalizer_fn=self.normalizer_fn,
         scope=self.scope_name)
     out_tensor = out_tensor
     if set_tensors:
@@ -1077,6 +1131,50 @@ class BatchNorm(Layer):
     return out_tensor
 
 
+class BatchNormalization(Layer):
+
+  def __init__(self,
+               epsilon=1e-5,
+               axis=-1,
+               momentum=0.99,
+               beta_init='zero',
+               gamma_init='one',
+               **kwargs):
+    self.beta_init = initializations.get(beta_init)
+    self.gamma_init = initializations.get(gamma_init)
+    self.epsilon = epsilon
+    self.axis = axis
+    self.momentum = momentum
+    super(BatchNormalization, self).__init__(**kwargs)
+
+  def add_weight(self, shape, initializer, name=None):
+    initializer = initializations.get(initializer)
+    weight = initializer(shape, name=name)
+    return weight
+
+  def build(self, input_shape):
+    shape = (input_shape[self.axis],)
+    self.gamma = self.add_weight(
+        shape, initializer=self.gamma_init, name='{}_gamma'.format(self.name))
+    self.beta = self.add_weight(
+        shape, initializer=self.beta_init, name='{}_beta'.format(self.name))
+
+  def create_tensor(self, in_layers=None, set_tensors=True, **kwargs):
+    inputs = self._get_input_tensors(in_layers)
+    x = inputs[0]
+    input_shape = model_ops.int_shape(x)
+    self.build(input_shape)
+    m = model_ops.mean(x, axis=-1, keepdims=True)
+    std = model_ops.sqrt(
+        model_ops.var(x, axis=-1, keepdims=True) + self.epsilon)
+    x_normed = (x - m) / (std + self.epsilon)
+    x_normed = self.gamma * x_normed + self.beta
+    out_tensor = x_normed
+    if set_tensors:
+      self.out_tensor = out_tensor
+    return out_tensor
+
+
 class WeightedError(Layer):
 
   def create_tensor(self, in_layers=None, set_tensors=True, **kwargs):
@@ -1165,7 +1263,7 @@ class VinaFreeEnergy(Layer):
       Coordinates/features.
     Z: tf.Tensor of shape (N)
       Atomic numbers of neighbor atoms.
-      
+
     Returns
     -------
     layer: tf.Tensor of shape (B)
@@ -1324,8 +1422,8 @@ class NeighborList(Layer):
     # List of length N_atoms each of shape (M_nbrs)
     padded_dists = [
         tf.reduce_sum((atom_coord - padded_nbr_coord)**2, axis=1)
-        for (atom_coord, padded_nbr_coord
-            ) in zip(atom_coords, padded_nbr_coords)
+        for (atom_coord,
+             padded_nbr_coord) in zip(atom_coords, padded_nbr_coords)
     ]
 
     padded_closest_nbrs = [
@@ -1336,8 +1434,8 @@ class NeighborList(Layer):
     # N_atoms elts of size (M_nbrs,) each
     padded_neighbor_list = [
         tf.gather(padded_atom_nbrs, padded_closest_nbr)
-        for (padded_atom_nbrs, padded_closest_nbr
-            ) in zip(padded_nbrs, padded_closest_nbrs)
+        for (padded_atom_nbrs,
+             padded_closest_nbr) in zip(padded_nbrs, padded_closest_nbrs)
     ]
 
     neighbor_list = tf.stack(padded_neighbor_list)
@@ -1387,19 +1485,19 @@ class NeighborList(Layer):
 
   def get_closest_atoms(self, coords, cells):
     """For each cell, find M_nbrs closest atoms.
-    
+
     Let N_atoms be the number of atoms.
-        
-    Parameters    
-    ----------    
-    coords: tf.Tensor 
+
+    Parameters
+    ----------
+    coords: tf.Tensor
       (N_atoms, ndim) shape.
     cells: tf.Tensor
       (n_cells, ndim) shape.
 
     Returns
     -------
-    closest_inds: tf.Tensor 
+    closest_inds: tf.Tensor
       Of shape (n_cells, M_nbrs)
     """
     N_atoms, n_cells, ndim, M_nbrs = (self.N_atoms, self.n_cells, self.ndim,
@@ -1466,16 +1564,16 @@ class NeighborList(Layer):
     return n_nbr_cells
 
   def get_neighbor_cells(self, cells):
-    """Compute neighbors of cells in grid.    
+    """Compute neighbors of cells in grid.
 
     # TODO(rbharath): Do we need to handle periodic boundary conditions
     properly here?
     # TODO(rbharath): This doesn't handle boundaries well. We hard-code
     # looking for n_nbr_cells neighbors, which isn't right for boundary cells in
     # the cube.
-        
-    Parameters    
-    ----------    
+
+    Parameters
+    ----------
     cells: tf.Tensor
       (n_cells, ndim) shape.
     Returns
@@ -1580,14 +1678,14 @@ class AtomicConvolution(Layer):
 
     Parameters
     ----------
-    
+
     atom_types: list or None
       Of length a, where a is number of atom types for filtering.
     radial_params: list
       Of length l, where l is number of radial filters learned.
     boxsize: float or None
       Simulation box length [Angstrom].
-    
+
     """
     self.boxsize = boxsize
     self.radial_params = radial_params
@@ -1604,11 +1702,11 @@ class AtomicConvolution(Layer):
       Neighbor list.
     Nbrs_Z: tf.Tensor of shape (B, N, M)
       Atomic numbers of neighbor atoms.
-    
+
     Returns
     -------
     layer: tf.Tensor of shape (B, N, l)
-      A new tensor representing the output of the atomic conv layer 
+      A new tensor representing the output of the atomic conv layer
     """
     inputs = self._get_input_tensors(in_layers)
     X = inputs[0]
@@ -1653,9 +1751,9 @@ class AtomicConvolution(Layer):
 
   def radial_symmetry_function(self, R, rc, rs, e):
     """Calculates radial symmetry function.
-  
+
     B = batch_size, N = max_num_atoms, M = max_num_neighbors, d = num_filters
-  
+
     Parameters
     ----------
     R: tf.Tensor of shape (B, N, M)
@@ -1666,12 +1764,12 @@ class AtomicConvolution(Layer):
       Gaussian distance matrix mean.
     e: float
       Gaussian distance matrix width.
-  
+
     Returns
     -------
     retval: tf.Tensor of shape (B, N, M)
       Radial symmetry function (before summation)
-  
+
     """
 
     with tf.name_scope(None, "NbrRadialSymmetryFunction", [rc, rs, e]):
@@ -1775,21 +1873,21 @@ class AtomicConvolution(Layer):
 
   def gather_neighbors(self, X, nbr_indices, B, N, M, d):
     """Gathers the neighbor subsets of the atoms in X.
-  
+
     B = batch_size, N = max_num_atoms, M = max_num_neighbors, d = num_features
-  
+
     Parameters
     ----------
     X: tf.Tensor of shape (B, N, d)
       Coordinates/features tensor.
     atom_indices: tf.Tensor of shape (B, M)
       Neighbor list for single atom.
-  
+
     Returns
     -------
     neighbors: tf.Tensor of shape (B, M, d)
       Neighbor coordinates/features tensor for single atom.
-  
+
     """
 
     example_tensors = tf.unstack(X, axis=0)

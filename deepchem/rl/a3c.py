@@ -33,18 +33,14 @@ class A3CLoss(Layer):
     return self.out_tensor
 
 
-def _create_feed_dict(features, state):
-  return dict((f.out_tensor, np.expand_dims(s, axis=0))
-              for f, s in zip(features, state))
-
-
 class A3C(object):
   """
   Implements the Asynchronous Advantage Actor-Critic (A3C) algorithm for reinforcement learning.
 
-  This algorithm requires the policy to output two quantities: a vector giving the probability of
-  taking each action, and an estimate of the value function for the current state.  It optimizes
-  both outputs at once using a loss that is the sum of three terms:
+  The algorithm is described in Mnih et al, "Asynchronous Methods for Deep Reinforcement Learning"
+  (https://arxiv.org/abs/1602.01783).  This class requires the policy to output two quantities:
+  a vector giving the probability of taking each action, and an estimate of the value function for
+  the current state.  It optimizes both outputs at once using a loss that is the sum of three terms:
 
   1. The policy loss, which seeks to maximize the discounted reward for each action.
   2. The value loss, which tries to make the value estimate match the actual discounted reward
@@ -53,6 +49,31 @@ class A3C(object):
 
   This class only supports environments with discrete action spaces, not continuous ones.  The
   "action" argument passed to the environment is an integer, giving the index of the action to perform.
+
+  This class supports Generalized Advantage Estimation as described in Schulman et al., "High-Dimensional
+  Continuous Control Using Generalized Advantage Estimation" (https://arxiv.org/abs/1506.02438).
+  This is a method of trading off bias and variance in the advantage estimate, which can sometimes
+  improve the rate of convergance.  Use the advantage_lambda parameter to adjust the tradeoff.
+
+  This class supports Hindsight Experience Replay as described in Andrychowicz et al., "Hindsight
+  Experience Replay" (https://arxiv.org/abs/1707.01495).  This is a method that can enormously
+  accelerate learning when rewards are very rare.  It requires that the environment state contains
+  information about the goal the agent is trying to achieve.  Each time it generates a rollout, it
+  processes that rollout twice: once using the actual goal the agent was pursuing while generating
+  it, and again using the final state of that rollout as the goal.  This guarantees that half of
+  all rollouts processed will be ones that achieved their goals, and hence received a reward.
+
+  To use this feature, specify use_hindsight=True to the constructor.  The environment must have
+  a method defined as follows:
+
+  def apply_hindsight(self, states, actions, goal):
+    ...
+    return new_states, rewards
+
+  The method receives the list of states generated during the rollout, the action taken for each one,
+  and a new goal state.  It should generate a new list of states that are identical to the input ones,
+  except specifying the new goal.  It should return that list of states, and the rewards that would
+  have been received for taking the specified actions from those states.
   """
 
   def __init__(self,
@@ -60,10 +81,12 @@ class A3C(object):
                policy,
                max_rollout_length=20,
                discount_factor=0.99,
+               advantage_lambda=0.98,
                value_weight=1.0,
                entropy_weight=0.01,
                optimizer=None,
-               model_dir=None):
+               model_dir=None,
+               use_hindsight=False):
     """Create an object for optimizing a policy.
 
     Parameters
@@ -85,13 +108,17 @@ class A3C(object):
       a callable object that creates the optimizer to use.  If None, a default optimizer is used.
     model_dir: str
       the directory in which the model will be saved.  If None, a temporary directory will be created.
+    use_hindsight: bool
+      if True, use Hindsight Experience Replay
     """
     self._env = env
     self._policy = policy
     self.max_rollout_length = max_rollout_length
     self.discount_factor = discount_factor
+    self.advantage_lambda = advantage_lambda
     self.value_weight = value_weight
     self.entropy_weight = entropy_weight
+    self.use_hindsight = use_hindsight
     if optimizer is None:
       self._optimizer = TFWrapper(
           tf.train.AdamOptimizer, learning_rate=0.001, beta1=0.9, beta2=0.999)
@@ -102,6 +129,7 @@ class A3C(object):
          None, 'global', model_dir)
     with self._graph._get_tf("Graph").as_default():
       self._session = tf.Session()
+    self._rnn_states = self._graph.rnn_zero_states
 
   def _build_graph(self, tf_graph, scope, model_dir):
     """Construct a TensorGraph containing the policy and loss calculations."""
@@ -182,26 +210,51 @@ class A3C(object):
         if len(threads) == 0:
           break
 
-  def predict(self, state):
+  def predict(self, state, use_saved_states=True, save_states=True):
     """Compute the policy's output predictions for a state.
+
+    If the policy involves recurrent layers, this method can preserve their internal
+    states between calls.  Use the use_saved_states and save_states arguments to specify
+    how it should behave.
 
     Parameters
     ----------
     state: array
       the state of the environment for which to generate predictions
+    use_saved_states: bool
+      if True, the states most recently saved by a previous call to predict() or select_action()
+      will be used as the initial states.  If False, the internal states of all recurrent layers
+      will be set to all zeros before computing the predictions.
+    save_states: bool
+      if True, the internal states of all recurrent layers at the end of the calculation
+      will be saved, and any previously saved states will be discarded.  If False, the
+      states at the end of the calculation will be discarded, and any previously saved
+      states will be kept.
 
     Returns
     -------
     the array of action probabilities, and the estimated value function
     """
     with self._graph._get_tf("Graph").as_default():
-      feed_dict = _create_feed_dict(self._features, state)
-      return self._session.run(
-          [self._action_prob.out_tensor, self._value.out_tensor],
-          feed_dict=feed_dict)
+      feed_dict = self._create_feed_dict(state, use_saved_states)
+      tensors = [self._action_prob.out_tensor, self._value.out_tensor]
+      if save_states:
+        tensors += self._graph.rnn_final_states
+      results = self._session.run(tensors, feed_dict=feed_dict)
+      if save_states:
+        self._rnn_states = results[2:]
+      return results[:2]
 
-  def select_action(self, state, deterministic=False):
+  def select_action(self,
+                    state,
+                    deterministic=False,
+                    use_saved_states=True,
+                    save_states=True):
     """Select an action to perform based on the environment's state.
+
+    If the policy involves recurrent layers, this method can preserve their internal
+    states between calls.  Use the use_saved_states and save_states arguments to specify
+    how it should behave.
 
     Parameters
     ----------
@@ -210,15 +263,29 @@ class A3C(object):
     deterministic: bool
       if True, always return the best action (that is, the one with highest probability).
       If False, randomly select an action based on the computed probabilities.
+    use_saved_states: bool
+      if True, the states most recently saved by a previous call to predict() or select_action()
+      will be used as the initial states.  If False, the internal states of all recurrent layers
+      will be set to all zeros before computing the predictions.
+    save_states: bool
+      if True, the internal states of all recurrent layers at the end of the calculation
+      will be saved, and any previously saved states will be discarded.  If False, the
+      states at the end of the calculation will be discarded, and any previously saved
+      states will be kept.
 
     Returns
     -------
     the index of the selected action
     """
     with self._graph._get_tf("Graph").as_default():
-      feed_dict = _create_feed_dict(self._features, state)
-      probabilities = self._session.run(
-          self._action_prob.out_tensor, feed_dict=feed_dict)
+      feed_dict = self._create_feed_dict(state, use_saved_states)
+      tensors = [self._action_prob.out_tensor]
+      if save_states:
+        tensors += self._graph.rnn_final_states
+      results = self._session.run(tensors, feed_dict=feed_dict)
+      probabilities = results[0]
+      if save_states:
+        self._rnn_states = results[1:]
       if deterministic:
         return probabilities.argmax()
       else:
@@ -236,6 +303,18 @@ class A3C(object):
       saver = tf.train.Saver(variables)
       saver.restore(self._session, last_checkpoint)
 
+  def _create_feed_dict(self, state, use_saved_states):
+    """Create a feed dict for use by predict() or select_action()."""
+    feed_dict = dict((f.out_tensor, np.expand_dims(s, axis=0))
+                     for f, s in zip(self._features, state))
+    if use_saved_states:
+      rnn_states = self._rnn_states
+    else:
+      rnn_states = self._graph.rnn_zero_states
+    for (placeholder, value) in zip(self._graph.rnn_initial_states, rnn_states):
+      feed_dict[placeholder] = value
+    return feed_dict
+
 
 class _Worker(object):
   """A Worker object is created for each training thread."""
@@ -248,6 +327,7 @@ class _Worker(object):
     self.env.reset()
     self.graph, self.features, self.rewards, self.actions, self.action_prob, self.value, self.advantages = a3c._build_graph(
         a3c._graph._get_tf('Graph'), self.scope, None)
+    self.rnn_states = self.graph.rnn_zero_states
     with a3c._graph._get_tf("Graph").as_default():
       local_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
                                      self.scope)
@@ -262,52 +342,130 @@ class _Worker(object):
 
   def run(self, step_count, total_steps):
     with self.graph._get_tf("Graph").as_default():
-      session = self.a3c._session
       while step_count[0] < total_steps:
-        session.run(self.update_local_variables)
-        episode_states, episode_actions, episode_rewards, episode_advantages = self.create_rollout(
-        )
-        feed_dict = {}
-        for f, s in zip(self.features, episode_states):
-          feed_dict[f.out_tensor] = s
-        feed_dict[self.rewards.out_tensor] = episode_rewards
-        feed_dict[self.actions.out_tensor] = episode_actions
-        feed_dict[self.advantages.out_tensor] = episode_advantages
-        session.run(self.train_op, feed_dict=feed_dict)
-        step_count[0] += len(episode_actions)
+        self.a3c._session.run(self.update_local_variables)
+        initial_rnn_states = self.rnn_states
+        states, actions, rewards, values = self.create_rollout()
+        self.process_rollout(states, actions, rewards, values,
+                             initial_rnn_states)
+        if self.a3c.use_hindsight:
+          self.process_rollout_with_hindsight(states, actions,
+                                              initial_rnn_states)
+        step_count[0] += len(actions)
 
   def create_rollout(self):
     """Generate a rollout."""
     n_actions = self.env.n_actions
     session = self.a3c._session
-    states = [[] for i in range(len(self.features))]
+    states = []
     actions = []
     rewards = []
     values = []
+
+    # Generate the rollout.
+
     for i in range(self.a3c.max_rollout_length):
       if self.env.terminated:
         break
       state = self.env.state
-      for j in range(len(state)):
-        states[j].append(state[j])
-      feed_dict = _create_feed_dict(self.features, state)
-      probabilities, value = session.run(
-          [self.action_prob.out_tensor, self.value.out_tensor],
+      states.append(state)
+      feed_dict = self.create_feed_dict(state)
+      results = session.run(
+          [self.action_prob.out_tensor, self.value.out_tensor] +
+          self.graph.rnn_final_states,
           feed_dict=feed_dict)
+      probabilities, value = results[:2]
+      self.rnn_states = results[2:]
       action = np.random.choice(np.arange(n_actions), p=probabilities[0])
-      actions.append(np.zeros(n_actions))
-      actions[i][action] = 1.0
+      actions.append(action)
       values.append(float(value))
       rewards.append(self.env.step(action))
+
+    # Compute an estimate of the reward for the rest of the episode.
+
     if not self.env.terminated:
-      # Add an estimate of the reward for the rest of the episode.
-      feed_dict = _create_feed_dict(self.features, self.env.state)
-      rewards[-1] += self.a3c.discount_factor * float(
+      feed_dict = self.create_feed_dict(self.env.state)
+      final_value = self.a3c.discount_factor * float(
           session.run(self.value.out_tensor, feed_dict))
-    for j in range(len(rewards) - 1, 0, -1):
-      rewards[j - 1] += self.a3c.discount_factor * rewards[j]
-    rewards_array = np.array(rewards)
-    advantages = rewards_array - np.array(values)
+    else:
+      final_value = 0.0
+    values.append(final_value)
     if self.env.terminated:
       self.env.reset()
-    return np.array(states), np.array(actions), rewards_array, advantages
+      self.rnn_states = self.graph.rnn_zero_states
+    return states, actions, np.array(rewards), np.array(values)
+
+  def process_rollout(self, states, actions, rewards, values,
+                      initial_rnn_states):
+    """Train the network based on a rollout."""
+
+    # Compute the discounted rewards and advantages.
+
+    discounted_rewards = rewards.copy()
+    discounted_rewards[-1] += values[-1]
+    advantages = rewards - values[:-1] + self.a3c.discount_factor * np.array(
+        values[1:])
+    for j in range(len(rewards) - 1, 0, -1):
+      discounted_rewards[j -
+                         1] += self.a3c.discount_factor * discounted_rewards[j]
+      advantages[
+          j -
+          1] += self.a3c.discount_factor * self.a3c.advantage_lambda * advantages[
+              j]
+
+    # Convert the actions to one-hot.
+
+    n_actions = self.env.n_actions
+    actions_matrix = []
+    for action in actions:
+      a = np.zeros(n_actions)
+      a[action] = 1.0
+      actions_matrix.append(a)
+
+    # Rearrange the states into the proper set of arrays.
+
+    state_arrays = [[] for i in range(len(self.features))]
+    for state in states:
+      for j in range(len(state)):
+        state_arrays[j].append(state[j])
+
+    # Build the feed dict and apply gradients.
+
+    feed_dict = {}
+    for placeholder, value in zip(self.graph.rnn_initial_states,
+                                  initial_rnn_states):
+      feed_dict[placeholder] = value
+    for f, s in zip(self.features, state_arrays):
+      feed_dict[f.out_tensor] = s
+    feed_dict[self.rewards.out_tensor] = discounted_rewards
+    feed_dict[self.actions.out_tensor] = actions_matrix
+    feed_dict[self.advantages.out_tensor] = advantages
+    self.a3c._session.run(self.train_op, feed_dict=feed_dict)
+
+  def process_rollout_with_hindsight(self, states, actions, initial_rnn_states):
+    """Create a new rollout by applying hindsight to an existing one, then train the network."""
+    hindsight_states, rewards = self.env.apply_hindsight(
+        states, actions, states[-1])
+    rnn_states = initial_rnn_states
+    values = []
+    session = self.a3c._session
+    for state in hindsight_states:
+      feed_dict = self.create_feed_dict(state)
+      results = session.run(
+          [self.value.out_tensor] + self.graph.rnn_final_states,
+          feed_dict=feed_dict)
+      values.append(float(results[0]))
+      rnn_states = results[1:]
+    values.append(0.0)
+    self.process_rollout(hindsight_states, actions,
+                         np.array(rewards), np.array(values),
+                         initial_rnn_states)
+
+  def create_feed_dict(self, state):
+    """Create a feed dict for use during a rollout."""
+    feed_dict = dict((f.out_tensor, np.expand_dims(s, axis=0))
+                     for f, s in zip(self.features, state))
+    for (placeholder, value) in zip(self.graph.rnn_initial_states,
+                                    self.rnn_states):
+      feed_dict[placeholder] = value
+    return feed_dict
