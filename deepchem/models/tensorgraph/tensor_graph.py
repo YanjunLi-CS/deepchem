@@ -13,8 +13,11 @@ from deepchem.data import NumpyDataset
 from deepchem.metrics import to_one_hot, from_one_hot
 from deepchem.models.models import Model
 from deepchem.models.tensorgraph.layers import InputFifoQueue, Label, Feature, Weights
+from deepchem.models.tensorgraph.optimizers import Adam
 from deepchem.trans import undo_transforms
 from deepchem.utils.evaluate import GeneratorEvaluator
+from deepchem.feat.graph_features import ConvMolFeaturizer
+from deepchem.data.data_loader import featurize_smiles_np
 
 
 class TensorGraph(Model):
@@ -52,6 +55,8 @@ class TensorGraph(Model):
     graph: tensorflow.Graph
       the Graph in which to create Tensorflow objects.  If None, a new Graph
       is created.
+    learning_rate: float or LearningRateSchedule
+      the learning rate to use for optimization
     kwargs
     """
 
@@ -65,12 +70,8 @@ class TensorGraph(Model):
     self.loss = None
     self.built = False
     self.queue_installed = False
-    self.optimizer = TFWrapper(
-        tf.train.AdamOptimizer,
-        learning_rate=learning_rate,
-        beta1=0.9,
-        beta2=0.999,
-        epsilon=1e-7)
+    self.optimizer = Adam(
+        learning_rate=learning_rate, beta1=0.9, beta2=0.999, epsilon=1e-7)
 
     # Singular place to hold Tensor objects which don't serialize
     # These have to be reconstructed on restoring from pickle
@@ -280,6 +281,40 @@ class TensorGraph(Model):
           results.append(result)
         return np.concatenate(results, axis=0)
 
+  def bayesian_predict_on_batch(self, X, transformers=[], n_passes=4):
+    """
+    Returns:
+      mu: numpy ndarray of shape (n_samples, n_tasks)
+      sigma: numpy ndarray of shape (n_samples, n_tasks)
+    """
+    dataset = NumpyDataset(X=X, y=None, n_tasks=len(self.outputs))
+    y_ = []
+    for i in range(n_passes):
+      generator = self.default_generator(
+          dataset, predict=True, pad_batches=True)
+      y_.append(self.predict_on_generator(generator, transformers))
+
+    y_ = np.concatenate(y_, axis=2)
+    mu = np.mean(y_, axis=2)
+    sigma = np.std(y_, axis=2)
+
+    return mu, sigma
+
+  def predict_on_smiles_batch(self,
+                              smiles,
+                              featurizer,
+                              n_tasks,
+                              transformers=[]):
+    """
+    # Returns:
+      A numpy ndarray of shape (n_samples, n_tasks)
+    """
+    convmols = featurize_smiles_np(smiles, featurizer)
+
+    dataset = NumpyDataset(X=convmols, y=None, n_tasks=len(self.outputs))
+    generator = self.default_generator(dataset, predict=True, pad_batches=True)
+    return self.predict_on_generator(generator, transformers)
+
   def predict_on_batch(self, X, sess=None, transformers=[]):
     """Generates output predictions for the input samples,
       processing the samples in a batched way.
@@ -389,11 +424,7 @@ class TensorGraph(Model):
     self.outputs.append(layer)
 
   def set_optimizer(self, optimizer):
-    """Set the optimizer to use for fitting.
-
-    The argument should be a callable object (most often a TFWrapper) that constructs
-    a Tensorflow optimizer when called.
-    """
+    """Set the optimizer to use for fitting."""
     self.optimizer = optimizer
 
   def get_pickling_errors(self, obj, seen=None):
@@ -526,7 +557,8 @@ class TensorGraph(Model):
     elif obj == "FileWriter":
       self.tensor_objects['FileWriter'] = tf.summary.FileWriter(self.model_dir)
     elif obj == 'Optimizer':
-      self.tensor_objects['Optimizer'] = self.optimizer()
+      self.tensor_objects['Optimizer'] = self.optimizer._create_optimizer(
+          self._get_tf('GlobalStep'))
     elif obj == 'train_op':
       self.tensor_objects['train_op'] = self._get_tf('Optimizer').minimize(
           self.loss.out_tensor, global_step=self._get_tf('GlobalStep'))
